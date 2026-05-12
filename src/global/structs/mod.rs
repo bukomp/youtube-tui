@@ -1,4 +1,5 @@
 //! enums and structs
+mod embedded_video;
 mod errors;
 mod history;
 mod item;
@@ -16,6 +17,7 @@ mod tasks;
 
 mod providers;
 
+pub use embedded_video::*;
 pub use errors::*;
 pub use history::*;
 pub use item::*;

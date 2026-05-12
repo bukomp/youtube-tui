@@ -5,6 +5,7 @@ use crate::{
 use ratatui::{backend::CrosstermBackend, Terminal};
 use std::{
     collections::HashSet,
+    env,
     error::Error,
     fs::{self},
     io::Stdout,
@@ -31,6 +32,19 @@ pub fn init(
     RUNTIME
         .set(Builder::new_current_thread().enable_all().build().unwrap())
         .unwrap();
+
+    // Detect a terminal that speaks the Kitty graphics protocol so commands.yml
+    // can use ${tui-video-vo} (e.g. `mpv --vo=${tui-video-vo}`) without each user
+    // having to hand-pick it. Unset = no detection, mpv will reject `--vo=` and
+    // surface a clear stderr message.
+    let kitty_graphics = env::var_os("KITTY_WINDOW_ID").is_some()
+        || env::var_os("GHOSTTY_RESOURCES_DIR").is_some()
+        || matches!(
+            env::var("TERM_PROGRAM").as_deref(),
+            Ok("ghostty") | Ok("WezTerm")
+        )
+        || env::var("TERM").as_deref() == Ok("xterm-kitty");
+    env::set_var("tui-video-vo", if kitty_graphics { "kitty" } else { "" });
 
     // creating files
     let data = paths::data_dir();
@@ -101,6 +115,11 @@ pub fn init(
         .data
         .global
         .insert::<MpvWrapper>(MpvWrapper::spawn());
+
+    framework
+        .data
+        .global
+        .insert::<EmbeddedVideo>(EmbeddedVideo::empty());
 
     framework.data.state.insert::<Tasks>(Tasks::default());
     framework.data.state.insert::<Page>(Page::default());

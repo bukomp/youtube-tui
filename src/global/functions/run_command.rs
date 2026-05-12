@@ -359,6 +359,45 @@ pub fn run_single_command(
                 let _ = child.wait();
             }
         }
+        ["runtty", ..] => {
+            let command = command[1..].join(" ");
+            *framework.data.global.get_mut::<Message>().unwrap() =
+                Message::Success(command.clone());
+            let shell = &framework.data.global.get::<MainConfig>().unwrap().shell;
+            let shell_flag = shell_flag(shell);
+
+            let _ = crossterm::terminal::disable_raw_mode();
+            let _ = crossterm::execute!(
+                std::io::stdout(),
+                crossterm::event::DisableMouseCapture,
+                crossterm::terminal::LeaveAlternateScreen,
+            );
+
+            if let Ok(mut child) = Command::new(shell)
+                .args([shell_flag, &command])
+                .stdin(Stdio::inherit())
+                .stdout(Stdio::inherit())
+                .stderr(Stdio::inherit())
+                .spawn()
+            {
+                let _ = child.wait();
+            }
+
+            let _ = crossterm::terminal::enable_raw_mode();
+            let _ = crossterm::execute!(
+                std::io::stdout(),
+                crossterm::terminal::EnterAlternateScreen,
+                crossterm::event::EnableMouseCapture,
+            );
+            let _ = terminal.clear();
+            framework
+                .data
+                .state
+                .get_mut::<Tasks>()
+                .unwrap()
+                .priority
+                .push(Task::RenderAll);
+        }
         ["parrun", ..] => {
             let command = command[1..].join(" ");
             *framework.data.global.get_mut::<Message>().unwrap() =
@@ -370,6 +409,81 @@ pub fn run_single_command(
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .spawn();
+        }
+        ["embed-play", rest @ ..] => {
+            if env::var("tui-video-vo").as_deref() != Ok("kitty") {
+                *framework.data.global.get_mut::<Message>().unwrap() = Message::Error(
+                    "Embedded video requires a Kitty-graphics terminal (Kitty/Ghostty/WezTerm)"
+                        .to_string(),
+                );
+            } else {
+                let url = rest.join(" ");
+                let url = url.trim().trim_matches('\'').trim_matches('"').to_string();
+                if url.is_empty() {
+                    *framework.data.global.get_mut::<Message>().unwrap() =
+                        Message::Error("embed-play: missing URL".to_string());
+                } else {
+                    let size = match terminal.size() {
+                        Ok(s) => (s.width, s.height),
+                        Err(_) => (80, 24),
+                    };
+                    let ev = framework.data.global.get_mut::<EmbeddedVideo>().unwrap();
+                    match ev.start(&url, size) {
+                        Ok(()) => {
+                            *framework.data.global.get_mut::<Message>().unwrap() =
+                                Message::Success(format!("Playing embedded: {url}"));
+                        }
+                        Err(e) => {
+                            *framework.data.global.get_mut::<Message>().unwrap() =
+                                Message::Error(e);
+                        }
+                    }
+                }
+            }
+            framework
+                .data
+                .state
+                .get_mut::<Tasks>()
+                .unwrap()
+                .priority
+                .push(Task::RenderAll);
+        }
+        ["embed-stop", ..] => {
+            let ev = framework.data.global.get_mut::<EmbeddedVideo>().unwrap();
+            ev.stop();
+            let _ = terminal.clear();
+            framework
+                .data
+                .state
+                .get_mut::<Tasks>()
+                .unwrap()
+                .priority
+                .push(Task::RenderAll);
+        }
+        ["embed-fullscreen", ..] => {
+            let size = match terminal.size() {
+                Ok(s) => (s.width, s.height),
+                Err(_) => (80, 24),
+            };
+            let ev = framework.data.global.get_mut::<EmbeddedVideo>().unwrap();
+            if !ev.is_playing() {
+                *framework.data.global.get_mut::<Message>().unwrap() =
+                    Message::Message("No embedded video is playing".to_string());
+            } else if let Err(e) = ev.toggle_fullscreen(size) {
+                *framework.data.global.get_mut::<Message>().unwrap() = Message::Error(e);
+            }
+            let _ = terminal.clear();
+            framework
+                .data
+                .state
+                .get_mut::<Tasks>()
+                .unwrap()
+                .priority
+                .push(Task::RenderAll);
+        }
+        ["embed-pause", ..] => {
+            let ev = framework.data.global.get::<EmbeddedVideo>().unwrap();
+            ev.cycle_pause();
         }
         #[cfg(feature = "clipboard")]
         ["copy", ..] => {

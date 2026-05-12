@@ -16,6 +16,11 @@ use crate::{
 //  - move thumbnails of videos in watch history to `~/.local/share/youtube-tui/watch_history/thumbnails`
 //  - remove `~/.cache`
 pub fn exit(framework: &mut Framework) -> Result<(), Box<dyn Error>> {
+    if let Some(ev) = framework.data.global.get_mut::<EmbeddedVideo>() {
+        if ev.is_playing() {
+            ev.stop();
+        }
+    }
     let limits = framework.data.global.remove::<MainConfig>().unwrap().limits;
     let mut watchhistory = framework.data.global.remove::<WatchHistory>().unwrap();
     watchhistory.trim(limits.watch_history);

@@ -174,6 +174,14 @@ fn global_default() -> HashMap<KeyCodeSerde, HashMap<u8, String>> {
             HashMap::from([(2, format!("run ${{browser}} {Q}${{url}}{Q}"))]),
         ),
         (
+            KeyCodeSerde::Char('F'),
+            HashMap::from([(1, String::from("embed-fullscreen"))]),
+        ),
+        (
+            KeyCodeSerde::Char('X'),
+            HashMap::from([(1, String::from("embed-stop"))]),
+        ),
+        (
             KeyCodeSerde::Char('c'),
             HashMap::from([(2, String::from("cp ${url}"))]),
         ),

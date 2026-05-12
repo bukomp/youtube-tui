@@ -132,6 +132,11 @@ impl TaskQueue {
 
         // save state in history, then replace all items by whats in the new page and run `.load()` on them
         if let Some(page) = self.load_page {
+            if let Some(ev) = framework.data.global.get_mut::<EmbeddedVideo>() {
+                if ev.is_playing() {
+                    ev.stop();
+                }
+            }
             *framework.data.global.get_mut::<Message>().unwrap() =
                 Message::Message(page.load_msg(framework));
             framework.push_history();

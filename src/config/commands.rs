@@ -118,6 +118,18 @@ fn video_default() -> Vec<HashMap<String, String>> {
             format!("parrun ${{video-player}} {q}${{embed-url}}{q}"),
         )]),
         HashMap::from([(
+            String::from("Play video (embedded)"),
+            format!("embed-play {q}${{embed-url}}{q}"),
+        )]),
+        HashMap::from([(
+            String::from("Toggle embedded fullscreen"),
+            String::from("embed-fullscreen"),
+        )]),
+        HashMap::from([(
+            String::from("Stop embedded video"),
+            String::from("embed-stop"),
+        )]),
+        HashMap::from([(
             String::from("Play audio"),
             format!("mpv stop ;; resume ;; mpv sprop loop-file no ;; mpv loadfile {q}${{embed-url}}{q} ;; echo mpv Player started"),
         )]),
@@ -175,6 +187,18 @@ fn saved_video_default() -> Vec<HashMap<String, String>> {
         HashMap::from([(
             String::from("[Offline] Play saved file"),
             format!("parrun ${{video-player}} {q}${{offline-path}}{q} --force-window"),
+        )]),
+        HashMap::from([(
+            String::from("[Offline] Play saved file (embedded)"),
+            format!("embed-play {q}${{offline-path}}{q}"),
+        )]),
+        HashMap::from([(
+            String::from("Toggle embedded fullscreen"),
+            String::from("embed-fullscreen"),
+        )]),
+        HashMap::from([(
+            String::from("Stop embedded video"),
+            String::from("embed-stop"),
         )]),
         HashMap::from([(
             String::from("[Offline] Play saved file (audio)"),

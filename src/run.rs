@@ -278,7 +278,11 @@ pub fn run(
                 key_input(key, framework, terminal)
             }
             // always render if there is a screen resize event
-            Event::Resize(_, _) => {
+            Event::Resize(cols, rows) => {
+                let ev = framework.data.global.get_mut::<EmbeddedVideo>().unwrap();
+                if ev.is_playing() {
+                    let _ = ev.resize_for((cols, rows));
+                }
                 framework
                     .data
                     .state
