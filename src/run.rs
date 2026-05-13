@@ -1,4 +1,4 @@
-use crossterm::event::{self, Event, KeyEventKind, MouseButton, MouseEventKind};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind};
 use ratatui::{backend::CrosstermBackend, Terminal};
 #[cfg(feature = "mpv")]
 use std::time::{Duration, Instant};
@@ -64,7 +64,80 @@ pub fn run(
 
         let mut updated = false;
 
-        match event::read()? {
+        let event = event::read()?;
+        let (embed_playing, embed_fullscreen) = framework
+            .data
+            .global
+            .get::<EmbeddedVideo>()
+            .map(|ev| (ev.is_playing(), ev.fullscreen))
+            .unwrap_or((false, false));
+
+        if embed_playing && embed_fullscreen {
+            match event {
+                Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+                    let is_exit_fs = matches!(key.code, KeyCode::Esc)
+                        || (shift && matches!(key.code, KeyCode::Char('F')));
+                    let is_stop = shift && matches!(key.code, KeyCode::Char('X'));
+                    if is_exit_fs {
+                        run_command("embed-fullscreen", framework, terminal);
+                    } else if is_stop {
+                        run_command("embed-stop", framework, terminal);
+                    } else if let Some(name) = crossterm_to_mpv_key(&key) {
+                        framework
+                            .data
+                            .global
+                            .get::<EmbeddedVideo>()
+                            .unwrap()
+                            .send_keypress(&name);
+                    }
+                }
+                Event::Resize(cols, rows) => {
+                    let ev = framework.data.global.get_mut::<EmbeddedVideo>().unwrap();
+                    let _ = ev.resize_for((cols, rows));
+                    framework
+                        .data
+                        .state
+                        .get_mut::<Tasks>()
+                        .unwrap()
+                        .priority
+                        .push(Task::RenderAll);
+                    framework
+                        .data
+                        .global
+                        .get_mut::<Status>()
+                        .unwrap()
+                        .render_image = true;
+                }
+                _ => {}
+            }
+            continue;
+        }
+
+        // Panel mode: steal the two embed control hotkeys only, let everything
+        // else fall through to normal TUI handling (typing into SearchBar,
+        // moving the cursor, opening menus, etc.).
+        if embed_playing {
+            if let Event::Key(key) = &event {
+                if key.kind == KeyEventKind::Press
+                    && key.modifiers.contains(KeyModifiers::SHIFT)
+                {
+                    match key.code {
+                        KeyCode::Char('F') => {
+                            run_command("embed-fullscreen", framework, terminal);
+                            continue;
+                        }
+                        KeyCode::Char('X') => {
+                            run_command("embed-stop", framework, terminal);
+                            continue;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        match event {
             Event::Mouse(mouse)
                 if framework
                     .data

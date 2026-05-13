@@ -1,3 +1,4 @@
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Rect;
 use std::{
     fs::OpenOptions,
@@ -19,6 +20,10 @@ pub struct EmbeddedVideo {
     pub child: Option<Child>,
     pub ipc_path: PathBuf,
     pub log_path: PathBuf,
+    /// Latched at `start()` time: when the caller knows where the preview
+    /// thumbnail is, we pin panel-mode resizes to the same cell rect instead of
+    /// the fallback hardcoded `panel_rect`. Cleared by `stop()`.
+    panel_hint: Option<Rect>,
 }
 
 impl Clone for EmbeddedVideo {
@@ -41,6 +46,7 @@ impl EmbeddedVideo {
             child: None,
             ipc_path: cache.join("mpv-embedded.sock"),
             log_path: cache.join("mpv-embedded.log"),
+            panel_hint: None,
         }
     }
 
@@ -48,19 +54,30 @@ impl EmbeddedVideo {
         self.child.is_some()
     }
 
-    pub fn start(&mut self, url: &str, term_size: (u16, u16)) -> Result<(), String> {
+    pub fn is_fullscreen_active(&self) -> bool {
+        self.is_playing() && self.fullscreen
+    }
+
+    pub fn start(
+        &mut self,
+        url: &str,
+        term_size: (u16, u16),
+        panel_hint: Option<Rect>,
+    ) -> Result<(), String> {
         if self.is_playing() {
             self.stop();
         }
         self.url = url.to_string();
         self.fullscreen = false;
-        self.rect = Self::panel_rect(term_size);
+        self.panel_hint = panel_hint.and_then(Self::sanitize_panel_rect);
+        self.rect = self.current_panel_rect(term_size);
         self.spawn_mpv(None)
     }
 
     pub fn stop(&mut self) {
         let _ = self.kill_mpv();
         Self::clear_graphics();
+        self.panel_hint = None;
     }
 
     pub fn toggle_fullscreen(&mut self, term_size: (u16, u16)) -> Result<(), String> {
@@ -73,7 +90,7 @@ impl EmbeddedVideo {
         self.rect = if self.fullscreen {
             Self::fullscreen_rect(term_size)
         } else {
-            Self::panel_rect(term_size)
+            self.current_panel_rect(term_size)
         };
         self.spawn_mpv(pos)
     }
@@ -87,9 +104,19 @@ impl EmbeddedVideo {
         self.rect = if self.fullscreen {
             Self::fullscreen_rect(term_size)
         } else {
-            Self::panel_rect(term_size)
+            self.current_panel_rect(term_size)
         };
         self.spawn_mpv(pos)
+    }
+
+    fn current_panel_rect(&self, term_size: (u16, u16)) -> Rect {
+        self.panel_hint
+            .filter(|r| r.width > 0 && r.height > 0)
+            .unwrap_or_else(|| Self::panel_rect(term_size))
+    }
+
+    fn sanitize_panel_rect(r: Rect) -> Option<Rect> {
+        (r.width >= 4 && r.height >= 2).then_some(r)
     }
 
     // Panel matches the preview-thumbnail position on the single-video page:
@@ -110,14 +137,31 @@ impl EmbeddedVideo {
         }
     }
 
-    // Fullscreen = entire terminal grid. mpv kitty vo positions cells 1-indexed.
+    // Fullscreen places a centered 16:9 cell rect inside the terminal grid.
+    // `vo_kitty` only emits the scaled video pixels (not the canvas), so we
+    // can't rely on mpv to letterbox/center for us — we pre-compute the cell
+    // origin so the kitty image lands centered. For non-16:9 videos mpv's
+    // `--keepaspect=yes` further shrinks the rendered frame inside this rect;
+    // the visible result is still centered (just with more black around it).
     fn fullscreen_rect(term_size: (u16, u16)) -> Rect {
         let (cols, rows) = term_size;
+        let (cell_w, cell_h) = Self::cell_pixels(term_size);
+        let cw = cell_w.max(1) as u32;
+        let ch = cell_h.max(1) as u32;
+        let canvas_w = cols.max(1) as u32 * cw;
+        let canvas_h = rows.max(1) as u32 * ch;
+        let (vid_w, vid_h) = if canvas_w * 9 >= canvas_h * 16 {
+            (canvas_h * 16 / 9, canvas_h)
+        } else {
+            (canvas_w, canvas_w * 9 / 16)
+        };
+        let off_x = canvas_w.saturating_sub(vid_w) / 2;
+        let off_y = canvas_h.saturating_sub(vid_h) / 2;
         Rect {
-            x: 1,
-            y: 1,
-            width: cols.max(1),
-            height: rows.max(1),
+            x: (off_x / cw) as u16 + 1,
+            y: (off_y / ch) as u16 + 1,
+            width: (vid_w / cw).max(1) as u16,
+            height: (vid_h / ch).max(1) as u16,
         }
     }
 
@@ -139,6 +183,10 @@ impl EmbeddedVideo {
     }
 
     fn spawn_mpv(&mut self, start_pos: Option<f64>) -> Result<(), String> {
+        if let Some(parent) = self.ipc_path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("failed to create cache dir {}: {e}", parent.display()))?;
+        }
         let _ = std::fs::remove_file(&self.ipc_path);
 
         let stderr = OpenOptions::new()
@@ -175,6 +223,15 @@ impl EmbeddedVideo {
             "--ytdl-format=bestvideo[height<=480]+bestaudio/best[height<=480]".into(),
             "--keep-open=no".into(),
         ];
+        if self.fullscreen {
+            args.extend([
+                "--background=color".into(),
+                "--background-color=#FF000000".into(),
+                "--keepaspect=yes".into(),
+                "--video-align-x=0".into(),
+                "--video-align-y=0".into(),
+            ]);
+        }
         if let Some(pos) = start_pos {
             args.push(format!("--start={pos}"));
         }
@@ -210,11 +267,8 @@ impl EmbeddedVideo {
             self.ipc_send(&format!("{{\"command\":[\"get_property\",\"{prop}\"]}}"))?;
         let key = "\"data\":";
         let idx = resp.find(key)?;
-        let tail = &resp[idx + key.len()..];
-        let tail = tail.trim_start();
-        let end = tail
-            .find(|c: char| c == ',' || c == '}')
-            .unwrap_or(tail.len());
+        let tail = resp[idx + key.len()..].trim_start();
+        let end = tail.find([',', '}']).unwrap_or(tail.len());
         tail[..end].trim().parse::<f64>().ok()
     }
 
@@ -240,9 +294,7 @@ impl EmbeddedVideo {
                         break;
                     }
                 }
-                Err(_) => {
-                    thread::sleep(Duration::from_millis(10));
-                }
+                Err(_) => thread::sleep(Duration::from_millis(10)),
             }
         }
         String::from_utf8(buf).ok()
@@ -250,6 +302,13 @@ impl EmbeddedVideo {
 
     pub fn cycle_pause(&self) {
         let _ = self.ipc_send("{\"command\":[\"cycle\",\"pause\"]}");
+    }
+
+    pub fn send_keypress(&self, name: &str) {
+        let escaped = name.replace('\\', "\\\\").replace('"', "\\\"");
+        let _ = self.ipc_send(&format!(
+            "{{\"command\":[\"keypress\",\"{escaped}\"]}}"
+        ));
     }
 
     fn clear_graphics() {
@@ -357,6 +416,42 @@ fn rewrite_kitty_z(buf: &[u8]) -> (Vec<u8>, Vec<u8>) {
         i += 1;
     }
     (out, Vec::new())
+}
+
+pub fn crossterm_to_mpv_key(key: &KeyEvent) -> Option<String> {
+    let (base, shift_implicit) = match key.code {
+        KeyCode::Char(' ') => ("SPACE".to_string(), false),
+        KeyCode::Char(c) => (c.to_string(), c.is_ascii_uppercase()),
+        KeyCode::Left => ("LEFT".to_string(), false),
+        KeyCode::Right => ("RIGHT".to_string(), false),
+        KeyCode::Up => ("UP".to_string(), false),
+        KeyCode::Down => ("DOWN".to_string(), false),
+        KeyCode::Enter => ("ENTER".to_string(), false),
+        KeyCode::Backspace => ("BS".to_string(), false),
+        KeyCode::Tab => ("TAB".to_string(), false),
+        KeyCode::Home => ("HOME".to_string(), false),
+        KeyCode::End => ("END".to_string(), false),
+        KeyCode::PageUp => ("PGUP".to_string(), false),
+        KeyCode::PageDown => ("PGDWN".to_string(), false),
+        KeyCode::Delete => ("DEL".to_string(), false),
+        KeyCode::Insert => ("INS".to_string(), false),
+        KeyCode::F(n) => (format!("F{n}"), false),
+        _ => return None,
+    };
+
+    let mods = key.modifiers;
+    let mut out = String::new();
+    if mods.contains(KeyModifiers::SHIFT) && !shift_implicit {
+        out.push_str("shift+");
+    }
+    if mods.contains(KeyModifiers::CONTROL) {
+        out.push_str("ctrl+");
+    }
+    if mods.contains(KeyModifiers::ALT) {
+        out.push_str("alt+");
+    }
+    out.push_str(&base);
+    Some(out)
 }
 
 #[cfg(test)]

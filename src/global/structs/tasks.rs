@@ -4,7 +4,11 @@ use crate::{
 };
 
 use ratatui::{
-    backend::CrosstermBackend, layout::Alignment, style::Style, widgets::Paragraph, Frame, Terminal,
+    backend::CrosstermBackend,
+    layout::Alignment,
+    style::{Color, Style},
+    widgets::{Block, Paragraph},
+    Frame, Terminal,
 };
 use std::{error::Error, fmt::Debug, io::Stdout, mem, sync::Arc};
 use tui_additions::framework::{CursorState, Framework};
@@ -293,6 +297,20 @@ impl TaskQueue {
             .prev_frame = Some(area);
 
         if Self::protective_screen(framework, frame) {
+            return;
+        }
+
+        if framework
+            .data
+            .global
+            .get::<EmbeddedVideo>()
+            .map(|ev| ev.is_fullscreen_active())
+            .unwrap_or(false)
+        {
+            frame.render_widget(
+                Block::default().style(Style::default().bg(Color::Rgb(0, 0, 0))),
+                frame.area(),
+            );
             return;
         }
 

@@ -75,8 +75,8 @@ impl FrameworkItem for ItemInfo {
                         ..Default::default()
                     };
 
-                    if let Ok((_, height)) = print_from_file(thumbnail_path, &config) {
-                        scroll = height as u16;
+                    if let Ok((img_w, img_h)) = print_from_file(thumbnail_path, &config) {
+                        scroll = img_h as u16;
                         framework
                             .data
                             .state
@@ -84,6 +84,17 @@ impl FrameworkItem for ItemInfo {
                             .unwrap()
                             .priority
                             .push(Task::LazyRendered);
+                        framework
+                            .data
+                            .global
+                            .get_mut::<Status>()
+                            .unwrap()
+                            .iteminfo_image_rect = Some(Rect {
+                            x: area.x,
+                            y: area.y,
+                            width: img_w as u16,
+                            height: img_h as u16,
+                        });
                     } else {
                         scroll = self.lazy_scroll;
                     }

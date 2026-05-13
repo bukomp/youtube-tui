@@ -427,8 +427,13 @@ pub fn run_single_command(
                         Ok(s) => (s.width, s.height),
                         Err(_) => (80, 24),
                     };
+                    let hint = framework
+                        .data
+                        .global
+                        .get::<Status>()
+                        .and_then(|s| s.iteminfo_image_rect);
                     let ev = framework.data.global.get_mut::<EmbeddedVideo>().unwrap();
-                    match ev.start(&url, size) {
+                    match ev.start(&url, size, hint) {
                         Ok(()) => {
                             *framework.data.global.get_mut::<Message>().unwrap() =
                                 Message::Success(format!("Playing embedded: {url}"));

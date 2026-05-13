@@ -23,6 +23,9 @@ pub struct Status {
     pub exit: bool,
     /// stores the area of the previously rendered frame
     pub prev_frame: Option<Rect>,
+    /// last on-screen cells the preview thumbnail occupied — used to anchor the
+    /// embedded video panel to the same area
+    pub iteminfo_image_rect: Option<Rect>,
     /// stores global provider (yt/inv)
     pub provider: Provider,
     /// if provider is updated, lasts for 1 event loop
@@ -46,6 +49,7 @@ impl Default for Status {
             command_history_index: None,
             command_editing_cache: String::new(),
             prev_frame: None,
+            iteminfo_image_rect: None,
             provider: Provider::YouTube,
             provider_updated: false,
             storage: TypeMap::custom(),
