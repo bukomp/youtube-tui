@@ -114,24 +114,60 @@ pub fn run(
             continue;
         }
 
-        // Panel mode: steal the two embed control hotkeys only, let everything
+        // Panel mode: steal the embed control hotkeys, let everything
         // else fall through to normal TUI handling (typing into SearchBar,
         // moving the cursor, opening menus, etc.).
         if embed_playing {
             if let Event::Key(key) = &event {
-                if key.kind == KeyEventKind::Press
-                    && key.modifiers.contains(KeyModifiers::SHIFT)
-                {
-                    match key.code {
-                        KeyCode::Char('F') => {
-                            run_command("embed-fullscreen", framework, terminal);
+                if key.kind == KeyEventKind::Press {
+                    if key.modifiers.contains(KeyModifiers::SHIFT) {
+                        match key.code {
+                            KeyCode::Char('F') => {
+                                run_command("embed-fullscreen", framework, terminal);
+                                continue;
+                            }
+                            KeyCode::Char('X') => {
+                                run_command("embed-stop", framework, terminal);
+                                continue;
+                            }
+                            _ => {}
+                        }
+                    }
+                    // Space toggles pause on the embedded mpv. The global
+                    // `tpause` binding talks to the libmpv-backed regular
+                    // player, which isn't what's playing here. Only let
+                    // Space fall through when the user is actually typing
+                    // — inside a command capture or with a SearchBar
+                    // selected — so a "Play (embedded)" button still
+                    // counting as `is_selected()` doesn't swallow pause.
+                    if matches!(key.code, KeyCode::Char(' '))
+                        && key.modifiers.is_empty()
+                    {
+                        let command_capturing = framework
+                            .data
+                            .global
+                            .get::<Status>()
+                            .unwrap()
+                            .command_capture
+                            .is_some();
+                        let typing_in_searchbar = framework.is_selected()
+                            && framework
+                                .cursor
+                                .selected(&framework.selectables)
+                                .map(|(x, y)| {
+                                    (*framework.state.get_mut(x, y)).type_id()
+                                        == TypeId::of::<SearchBar>()
+                                })
+                                .unwrap_or(false);
+                        if !command_capturing && !typing_in_searchbar {
+                            framework
+                                .data
+                                .global
+                                .get::<EmbeddedVideo>()
+                                .unwrap()
+                                .cycle_pause();
                             continue;
                         }
-                        KeyCode::Char('X') => {
-                            run_command("embed-stop", framework, terminal);
-                            continue;
-                        }
-                        _ => {}
                     }
                 }
             }

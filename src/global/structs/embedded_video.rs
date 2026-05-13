@@ -6,6 +6,7 @@ use std::{
     os::unix::net::UnixStream,
     path::PathBuf,
     process::{Child, ChildStdout, Command, Stdio},
+    sync::{Arc, Mutex},
     thread,
     time::{Duration, Instant},
 };
@@ -24,6 +25,14 @@ pub struct EmbeddedVideo {
     /// thumbnail is, we pin panel-mode resizes to the same cell rect instead of
     /// the fallback hardcoded `panel_rect`. Cleared by `stop()`.
     panel_hint: Option<Rect>,
+    /// Direct stream URLs from a separate `yt-dlp -g` invocation kicked off in
+    /// the background at `start()` time. Once populated, every subsequent
+    /// respawn (fullscreen toggle / terminal resize) skips mpv's own yt-dlp
+    /// hook via `--no-ytdl`, which removes the multi-second resolution delay
+    /// that made Shift+F feel like a restart.
+    /// `(video_url, optional_audio_url)` — audio is `None` when yt-dlp picked
+    /// a single muxed format.
+    direct_urls: Arc<Mutex<Option<(String, Option<String>)>>>,
 }
 
 impl Clone for EmbeddedVideo {
@@ -47,6 +56,7 @@ impl EmbeddedVideo {
             ipc_path: cache.join("mpv-embedded.sock"),
             log_path: cache.join("mpv-embedded.log"),
             panel_hint: None,
+            direct_urls: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -71,6 +81,8 @@ impl EmbeddedVideo {
         self.fullscreen = false;
         self.panel_hint = panel_hint.and_then(Self::sanitize_panel_rect);
         self.rect = self.current_panel_rect(term_size);
+        *self.direct_urls.lock().unwrap() = None;
+        self.spawn_url_prefetch();
         self.spawn_mpv(None)
     }
 
@@ -78,6 +90,51 @@ impl EmbeddedVideo {
         let _ = self.kill_mpv();
         Self::clear_graphics();
         self.panel_hint = None;
+        *self.direct_urls.lock().unwrap() = None;
+    }
+
+    // Resolve the direct CDN URLs for the current video in a background
+    // thread. Once cached, every respawn skips mpv's yt-dlp hook (`--no-ytdl`)
+    // and just opens the URLs directly — that's what makes Shift+F feel
+    // instant instead of a multi-second restart.
+    fn spawn_url_prefetch(&self) {
+        let url = self.url.clone();
+        let cache = self.direct_urls.clone();
+        thread::spawn(move || {
+            // Use a single muxed format for the respawn URL so toggles only
+            // open one HTTP stream (vs. separate video+audio, which would
+            // double the network setup time). YouTube's best muxed format at
+            // <=480p is 360p (itag 18); the small quality drop on toggle is
+            // worth the ~half-second saving.
+            let output = Command::new("yt-dlp")
+                .args([
+                    "-g",
+                    "-f",
+                    "best[height<=480]",
+                    "--no-warnings",
+                    "--",
+                    &url,
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .output();
+            let Ok(out) = output else { return };
+            if !out.status.success() {
+                return;
+            }
+            let s = String::from_utf8_lossy(&out.stdout);
+            let urls: Vec<String> = s
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .map(String::from)
+                .collect();
+            if let Some(video) = urls.first() {
+                let audio = urls.get(1).cloned();
+                *cache.lock().unwrap() = Some((video.clone(), audio));
+            }
+        });
     }
 
     pub fn toggle_fullscreen(&mut self, term_size: (u16, u16)) -> Result<(), String> {
@@ -115,8 +172,22 @@ impl EmbeddedVideo {
             .unwrap_or_else(|| Self::panel_rect(term_size))
     }
 
+    // Inset the thumbnail rect on the top and left by one cell so the embedded
+    // video doesn't kiss the iteminfo column borders, and extend the right and
+    // bottom edges one cell past the thumbnail bounds so the image fills the
+    // available column.
     fn sanitize_panel_rect(r: Rect) -> Option<Rect> {
-        (r.width >= 4 && r.height >= 2).then_some(r)
+        const MARGIN: u16 = 1;
+        const EXTEND: u16 = 1;
+        if r.width < MARGIN + 4 || r.height < MARGIN + 2 {
+            return None;
+        }
+        Some(Rect {
+            x: r.x + MARGIN,
+            y: r.y + MARGIN,
+            width: r.width - MARGIN + EXTEND,
+            height: r.height - MARGIN + EXTEND,
+        })
     }
 
     // Panel matches the preview-thumbnail position on the single-video page:
@@ -205,6 +276,8 @@ impl EmbeddedVideo {
         let img_w_px = (self.rect.width as u32) * (cell_w_px as u32);
         let img_h_px = (self.rect.height as u32) * (cell_h_px as u32);
 
+        let direct = self.direct_urls.lock().unwrap().clone();
+
         let mut args: Vec<String> = vec![
             "--vo=kitty".into(),
             format!("--vo-kitty-left={}", self.rect.x),
@@ -220,9 +293,31 @@ impl EmbeddedVideo {
             "--msg-level=all=error".into(),
             "--no-terminal".into(),
             format!("--input-ipc-server={}", self.ipc_path.display()),
-            "--ytdl-format=bestvideo[height<=480]+bestaudio/best[height<=480]".into(),
             "--keep-open=no".into(),
         ];
+        match &direct {
+            Some((_, audio)) => {
+                args.push("--no-ytdl".into());
+                if let Some(audio_url) = audio {
+                    args.push(format!("--audio-file={audio_url}"));
+                }
+                // Aggressive startup options for the toggle/respawn path:
+                // skip most demuxer probing (we know it's an mp4/webm http
+                // stream) and use keyframe-accurate seek so resuming the
+                // saved playback position doesn't pull extra data.
+                args.push(
+                    "--demuxer-lavf-o-add=probesize=131072,analyzeduration=200000"
+                        .into(),
+                );
+                args.push("--hr-seek=no".into());
+            }
+            None => {
+                args.push(
+                    "--ytdl-format=bestvideo[height<=480]+bestaudio/best[height<=480]"
+                        .into(),
+                );
+            }
+        }
         if self.fullscreen {
             args.extend([
                 "--background=color".into(),
@@ -235,7 +330,11 @@ impl EmbeddedVideo {
         if let Some(pos) = start_pos {
             args.push(format!("--start={pos}"));
         }
-        args.push(self.url.clone());
+        let primary_url = match &direct {
+            Some((video, _)) => video.clone(),
+            None => self.url.clone(),
+        };
+        args.push(primary_url);
 
         let mut child = Command::new("mpv")
             .args(&args)
