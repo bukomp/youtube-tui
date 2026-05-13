@@ -27,6 +27,7 @@ impl MpvWrapper {
         thread::spawn(move || {
             let mpv = Mpv::new().unwrap();
             mpv.set_property("video", "no").unwrap();
+            mpv.set_property("ytdl-format", "bestaudio/best").unwrap();
             loop {
                 let action = match receiver.recv() {
                     Ok(res) => res,

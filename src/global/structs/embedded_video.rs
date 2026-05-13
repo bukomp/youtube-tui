@@ -101,16 +101,15 @@ impl EmbeddedVideo {
         let url = self.url.clone();
         let cache = self.direct_urls.clone();
         thread::spawn(move || {
-            // Use a single muxed format for the respawn URL so toggles only
-            // open one HTTP stream (vs. separate video+audio, which would
-            // double the network setup time). YouTube's best muxed format at
-            // <=480p is 360p (itag 18); the small quality drop on toggle is
-            // worth the ~half-second saving.
+            // Request separate video+audio streams so audio is best available
+            // quality (muxed `best[height<=480]` would lock us into itag 18's
+            // 96kbps AAC). yt-dlp returns two URLs; spawn_mpv pairs them via
+            // `--audio-file=`.
             let output = Command::new("yt-dlp")
                 .args([
                     "-g",
                     "-f",
-                    "best[height<=480]",
+                    "bestvideo[height<=480]+bestaudio/best",
                     "--no-warnings",
                     "--",
                     &url,
