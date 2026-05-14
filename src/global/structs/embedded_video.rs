@@ -3,16 +3,30 @@ use ratatui::layout::Rect;
 use std::{
     fs::OpenOptions,
     io::{Read, Write},
-    os::unix::net::UnixStream,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Child, ChildStdout, Command, Stdio},
     sync::{Arc, Mutex},
     thread,
-    time::{Duration, Instant},
+    time::Duration,
 };
+#[cfg(unix)]
+use std::time::Instant;
 use typemap::Key;
 
+#[cfg(unix)]
+use std::os::unix::net::UnixStream;
+
 use crate::global::functions::paths;
+
+/// Which mpv video-output driver to use for in-terminal rendering. Picked
+/// once per session from the host terminal (env vars) — Kitty graphics
+/// protocol where supported (Kitty, Ghostty, WezTerm, Konsole), sixel
+/// elsewhere including iTerm2 ≥ 3.5.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VideoOutput {
+    Kitty,
+    Sixel,
+}
 
 pub struct EmbeddedVideo {
     pub url: String,
@@ -33,6 +47,7 @@ pub struct EmbeddedVideo {
     /// `(video_url, optional_audio_url)` — audio is `None` when yt-dlp picked
     /// a single muxed format.
     direct_urls: Arc<Mutex<Option<(String, Option<String>)>>>,
+    vo: VideoOutput,
 }
 
 impl Clone for EmbeddedVideo {
@@ -53,11 +68,16 @@ impl EmbeddedVideo {
             fullscreen: false,
             rect: Rect::default(),
             child: None,
-            ipc_path: cache.join("mpv-embedded.sock"),
+            ipc_path: default_ipc_path(&cache),
             log_path: cache.join("mpv-embedded.log"),
             panel_hint: None,
             direct_urls: Arc::new(Mutex::new(None)),
+            vo: detect_video_output(),
         }
+    }
+
+    pub fn vo(&self) -> VideoOutput {
+        self.vo
     }
 
     pub fn is_playing(&self) -> bool {
@@ -88,7 +108,7 @@ impl EmbeddedVideo {
 
     pub fn stop(&mut self) {
         let _ = self.kill_mpv();
-        Self::clear_graphics();
+        self.clear_graphics();
         self.panel_hint = None;
         *self.direct_urls.lock().unwrap() = None;
     }
@@ -142,7 +162,7 @@ impl EmbeddedVideo {
         }
         let aspect = self.query_video_aspect();
         let pos = self.kill_mpv();
-        Self::clear_graphics();
+        self.clear_graphics();
         self.fullscreen = !self.fullscreen;
         self.rect = if self.fullscreen {
             Self::fullscreen_rect(term_size, aspect)
@@ -162,7 +182,7 @@ impl EmbeddedVideo {
             None
         };
         let pos = self.kill_mpv();
-        Self::clear_graphics();
+        self.clear_graphics();
         self.rect = if self.fullscreen {
             Self::fullscreen_rect(term_size, aspect)
         } else {
@@ -283,11 +303,19 @@ impl EmbeddedVideo {
     }
 
     fn spawn_mpv(&mut self, start_pos: Option<f64>) -> Result<(), String> {
-        if let Some(parent) = self.ipc_path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("failed to create cache dir {}: {e}", parent.display()))?;
+        // Windows uses a named-pipe path (`\\.\pipe\<name>`) that has no
+        // parent directory in the filesystem and cannot be `remove_file`d —
+        // mpv creates/destroys the pipe itself. On unix the IPC path is a
+        // socket file we own and can prep.
+        #[cfg(unix)]
+        {
+            if let Some(parent) = self.ipc_path.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    format!("failed to create cache dir {}: {e}", parent.display())
+                })?;
+            }
+            let _ = std::fs::remove_file(&self.ipc_path);
         }
-        let _ = std::fs::remove_file(&self.ipc_path);
 
         let stderr = OpenOptions::new()
             .create(true)
@@ -307,23 +335,40 @@ impl EmbeddedVideo {
 
         let direct = self.direct_urls.lock().unwrap().clone();
 
-        let mut args: Vec<String> = vec![
-            "--vo=kitty".into(),
-            format!("--vo-kitty-left={}", self.rect.x),
-            format!("--vo-kitty-top={}", self.rect.y),
-            format!("--vo-kitty-cols={}", term_size.0),
-            format!("--vo-kitty-rows={}", term_size.1),
-            format!("--vo-kitty-width={img_w_px}"),
-            format!("--vo-kitty-height={img_h_px}"),
-            "--vo-kitty-alt-screen=no".into(),
-            "--vo-kitty-config-clear=no".into(),
-            "--vo-kitty-use-shm=no".into(),
+        let mut args: Vec<String> = match self.vo {
+            VideoOutput::Kitty => vec![
+                "--vo=kitty".into(),
+                format!("--vo-kitty-left={}", self.rect.x),
+                format!("--vo-kitty-top={}", self.rect.y),
+                format!("--vo-kitty-cols={}", term_size.0),
+                format!("--vo-kitty-rows={}", term_size.1),
+                format!("--vo-kitty-width={img_w_px}"),
+                format!("--vo-kitty-height={img_h_px}"),
+                "--vo-kitty-alt-screen=no".into(),
+                "--vo-kitty-config-clear=no".into(),
+                "--vo-kitty-use-shm=no".into(),
+            ],
+            VideoOutput::Sixel => vec![
+                "--vo=sixel".into(),
+                format!("--vo-sixel-left={}", self.rect.x),
+                format!("--vo-sixel-top={}", self.rect.y),
+                format!("--vo-sixel-cols={}", term_size.0),
+                format!("--vo-sixel-rows={}", term_size.1),
+                format!("--vo-sixel-width={img_w_px}"),
+                format!("--vo-sixel-height={img_h_px}"),
+                "--vo-sixel-alt-screen=no".into(),
+                "--vo-sixel-config-clear=no".into(),
+                "--vo-sixel-exit-clear=no".into(),
+                "--vo-sixel-buffered=yes".into(),
+            ],
+        };
+        args.extend([
             "--profile=sw-fast".into(),
             "--msg-level=all=error".into(),
             "--no-terminal".into(),
             format!("--input-ipc-server={}", self.ipc_path.display()),
             "--keep-open=no".into(),
-        ];
+        ]);
         match &direct {
             Some((_, audio)) => {
                 args.push("--no-ytdl".into());
@@ -365,16 +410,27 @@ impl EmbeddedVideo {
         };
         args.push(primary_url);
 
+        let stdout_pipe = match self.vo {
+            // Kitty needs an interceptor to rewrite z-index on every placement
+            // APC so the image renders above ratatui's text cells.
+            VideoOutput::Kitty => Stdio::piped(),
+            // Sixel is a stream of cell-positioned image escape codes — let it
+            // hit the terminal directly, no rewriting required.
+            VideoOutput::Sixel => Stdio::inherit(),
+        };
+
         let mut child = Command::new("mpv")
             .args(&args)
             .stdin(Stdio::null())
-            .stdout(Stdio::piped())
+            .stdout(stdout_pipe)
             .stderr(stderr)
             .spawn()
             .map_err(|e| format!("failed to spawn mpv: {e}"))?;
 
-        if let Some(stdout) = child.stdout.take() {
-            spawn_kitty_proxy(stdout);
+        if self.vo == VideoOutput::Kitty {
+            if let Some(stdout) = child.stdout.take() {
+                spawn_kitty_proxy(stdout);
+            }
         }
         self.child = Some(child);
         Ok(())
@@ -386,6 +442,10 @@ impl EmbeddedVideo {
             let _ = child.kill();
             let _ = child.wait();
         }
+        // Unix socket lives in our cache dir — clean it up so the next spawn
+        // doesn't bind onto a stale path. Windows named pipes live in kernel
+        // object namespace and are reaped when mpv exits.
+        #[cfg(unix)]
         let _ = std::fs::remove_file(&self.ipc_path);
         pos
     }
@@ -400,6 +460,7 @@ impl EmbeddedVideo {
         tail[..end].trim().parse::<f64>().ok()
     }
 
+    #[cfg(unix)]
     fn ipc_send(&self, json: &str) -> Option<String> {
         if !self.ipc_path.exists() {
             return None;
@@ -428,6 +489,48 @@ impl EmbeddedVideo {
         String::from_utf8(buf).ok()
     }
 
+    /// Windows talks to mpv over a named pipe at `\\.\pipe\<name>` opened as
+    /// a plain `File` — stdlib has no portable per-handle read timeout there.
+    /// We do the write inline, then move the read onto a thread and gate the
+    /// result on a `recv_timeout`. If mpv hangs and the read blocks past the
+    /// deadline, the thread is orphaned holding a cloned handle and will
+    /// unblock the next time mpv writes (or when mpv is killed and the pipe
+    /// closes), so the leak is bounded by the player's lifetime.
+    #[cfg(windows)]
+    fn ipc_send(&self, json: &str) -> Option<String> {
+        let mut stream = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&self.ipc_path)
+            .ok()?;
+        stream.write_all(json.as_bytes()).ok()?;
+        stream.write_all(b"\n").ok()?;
+
+        let reader = stream.try_clone().ok()?;
+        let (tx, rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let mut reader = reader;
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 1024];
+            loop {
+                match reader.read(&mut tmp) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        buf.extend_from_slice(&tmp[..n]);
+                        if buf.contains(&b'\n') {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            let _ = tx.send(String::from_utf8(buf).ok());
+        });
+        let result = rx.recv_timeout(Duration::from_millis(200)).ok().flatten();
+        drop(stream);
+        result
+    }
+
     pub fn cycle_pause(&self) {
         let _ = self.ipc_send("{\"command\":[\"cycle\",\"pause\"]}");
     }
@@ -439,11 +542,22 @@ impl EmbeddedVideo {
         ));
     }
 
-    fn clear_graphics() {
-        let stdout = std::io::stdout();
-        let mut handle = stdout.lock();
-        let _ = handle.write_all(b"\x1b_Ga=d,d=A\x1b\\");
-        let _ = handle.flush();
+    fn clear_graphics(&self) {
+        match self.vo {
+            // Kitty graphics images persist as a separate layer until told to
+            // go away — emit the delete-all APC so the panel doesn't keep
+            // showing a frozen last frame on the layer above ratatui.
+            VideoOutput::Kitty => {
+                let stdout = std::io::stdout();
+                let mut handle = stdout.lock();
+                let _ = handle.write_all(b"\x1b_Ga=d,d=A\x1b\\");
+                let _ = handle.flush();
+            }
+            // Sixel writes pixels into cell-positioned bands; the next ratatui
+            // redraw overpaints those cells naturally — no clear command
+            // needed (and iTerm2 has no inverse "delete all sixel" anyway).
+            VideoOutput::Sixel => {}
+        }
     }
 }
 
@@ -544,6 +658,72 @@ fn rewrite_kitty_z(buf: &[u8]) -> (Vec<u8>, Vec<u8>) {
         i += 1;
     }
     (out, Vec::new())
+}
+
+/// Pick the mpv video-output driver based on the host terminal. Kitty,
+/// Ghostty, WezTerm, and Konsole speak the Kitty graphics protocol; iTerm2 ≥
+/// 3.5, Windows Terminal ≥ 1.22, and most other modern terminals fall back
+/// to sixel. The `YOUTUBE_TUI_VO=kitty|sixel` env var overrides the
+/// auto-detection.
+fn detect_video_output() -> VideoOutput {
+    if let Ok(forced) = std::env::var("YOUTUBE_TUI_VO") {
+        match forced.trim().to_ascii_lowercase().as_str() {
+            "kitty" => return VideoOutput::Kitty,
+            "sixel" => return VideoOutput::Sixel,
+            _ => {}
+        }
+    }
+
+    let term_program = std::env::var("TERM_PROGRAM").unwrap_or_default();
+    let lc_terminal = std::env::var("LC_TERMINAL").unwrap_or_default();
+    if term_program == "iTerm.app" || lc_terminal.eq_ignore_ascii_case("iTerm2") {
+        return VideoOutput::Sixel;
+    }
+
+    // Windows Terminal advertises itself via WT_SESSION (a GUID). It gained
+    // sixel support in 1.22 (late 2024). Older WT will silently drop the
+    // image data — users on those builds need to set YOUTUBE_TUI_VO=kitty
+    // and pair it with a wrapping Kitty-graphics-capable terminal, or
+    // upgrade.
+    if std::env::var("WT_SESSION").is_ok() {
+        return VideoOutput::Sixel;
+    }
+
+    let term = std::env::var("TERM").unwrap_or_default();
+    if term.contains("kitty")
+        || term.contains("ghostty")
+        || std::env::var("KITTY_WINDOW_ID").is_ok()
+        || std::env::var("GHOSTTY_RESOURCES_DIR").is_ok()
+        || std::env::var("GHOSTTY_BIN_DIR").is_ok()
+        || term_program == "WezTerm"
+        || std::env::var("KONSOLE_VERSION").is_ok()
+    {
+        return VideoOutput::Kitty;
+    }
+
+    // Unknown terminal: sixel is the lowest-common-denominator that works on
+    // iTerm2, WezTerm (without kitty graphics enabled), foot, mlterm, and
+    // xterm built with sixel support.
+    VideoOutput::Sixel
+}
+
+/// Where mpv's JSON IPC endpoint lives. On unix it's a socket file inside
+/// our cache dir; on Windows it's a named pipe at `\\.\pipe\<name>`, which
+/// is a kernel object namespace path with no filesystem parent.
+fn default_ipc_path(cache: &Path) -> PathBuf {
+    #[cfg(unix)]
+    {
+        cache.join("mpv-embedded.sock")
+    }
+    #[cfg(windows)]
+    {
+        let _ = cache;
+        PathBuf::from(r"\\.\pipe\youtube-tui-mpv")
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        cache.join("mpv-embedded.sock")
+    }
 }
 
 pub fn crossterm_to_mpv_key(key: &KeyEvent) -> Option<String> {
