@@ -140,11 +140,12 @@ impl EmbeddedVideo {
         if !self.is_playing() {
             return Ok(());
         }
+        let aspect = self.query_video_aspect();
         let pos = self.kill_mpv();
         Self::clear_graphics();
         self.fullscreen = !self.fullscreen;
         self.rect = if self.fullscreen {
-            Self::fullscreen_rect(term_size)
+            Self::fullscreen_rect(term_size, aspect)
         } else {
             self.current_panel_rect(term_size)
         };
@@ -155,14 +156,35 @@ impl EmbeddedVideo {
         if !self.is_playing() {
             return Ok(());
         }
+        let aspect = if self.fullscreen {
+            self.query_video_aspect()
+        } else {
+            None
+        };
         let pos = self.kill_mpv();
         Self::clear_graphics();
         self.rect = if self.fullscreen {
-            Self::fullscreen_rect(term_size)
+            Self::fullscreen_rect(term_size, aspect)
         } else {
             self.current_panel_rect(term_size)
         };
         self.spawn_mpv(pos)
+    }
+
+    // Source video display aspect (dwidth/dheight) so the fullscreen rect can
+    // be sized to the video itself instead of a fixed 16:9 box — otherwise
+    // narrower (e.g. 4:3) clips render anchored to the rect's top-left with
+    // slack on the right, since vo_kitty doesn't center within its
+    // width/height bounds. Returns None when mpv hasn't reported dimensions
+    // yet; caller falls back to 16:9.
+    fn query_video_aspect(&self) -> Option<f64> {
+        let w = self.ipc_get_f64("dwidth")?;
+        let h = self.ipc_get_f64("dheight")?;
+        if w > 0.0 && h > 0.0 {
+            Some(w / h)
+        } else {
+            None
+        }
     }
 
     fn current_panel_rect(&self, term_size: (u16, u16)) -> Rect {
@@ -207,23 +229,31 @@ impl EmbeddedVideo {
         }
     }
 
-    // Fullscreen places a centered 16:9 cell rect inside the terminal grid.
-    // `vo_kitty` only emits the scaled video pixels (not the canvas), so we
-    // can't rely on mpv to letterbox/center for us — we pre-compute the cell
-    // origin so the kitty image lands centered. For non-16:9 videos mpv's
-    // `--keepaspect=yes` further shrinks the rendered frame inside this rect;
-    // the visible result is still centered (just with more black around it).
-    fn fullscreen_rect(term_size: (u16, u16)) -> Rect {
+    // Fullscreen places a centered cell rect inside the terminal grid, sized
+    // to the actual video aspect (falling back to 16:9 when unknown).
+    // `vo_kitty` anchors the scaled image to the rect's top-left rather than
+    // centering within `width/height`, so we have to size the rect tight to
+    // the video — letting mpv letterbox inside a generic 16:9 rect would
+    // leave slack on the right for narrower clips.
+    fn fullscreen_rect(term_size: (u16, u16), aspect: Option<f64>) -> Rect {
         let (cols, rows) = term_size;
         let (cell_w, cell_h) = Self::cell_pixels(term_size);
         let cw = cell_w.max(1) as u32;
         let ch = cell_h.max(1) as u32;
         let canvas_w = cols.max(1) as u32 * cw;
         let canvas_h = rows.max(1) as u32 * ch;
-        let (vid_w, vid_h) = if canvas_w * 9 >= canvas_h * 16 {
-            (canvas_h * 16 / 9, canvas_h)
+        let aspect = aspect
+            .filter(|a| a.is_finite() && *a > 0.1)
+            .unwrap_or(16.0 / 9.0);
+        let canvas_aspect = (canvas_w as f64) / (canvas_h as f64);
+        let (vid_w, vid_h) = if canvas_aspect >= aspect {
+            let h = canvas_h;
+            let w = (((h as f64) * aspect).round() as u32).min(canvas_w);
+            (w, h)
         } else {
-            (canvas_w, canvas_w * 9 / 16)
+            let w = canvas_w;
+            let h = (((w as f64) / aspect).round() as u32).min(canvas_h);
+            (w, h)
         };
         let off_x = canvas_w.saturating_sub(vid_w) / 2;
         let off_y = canvas_h.saturating_sub(vid_h) / 2;
